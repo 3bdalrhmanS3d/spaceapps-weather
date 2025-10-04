@@ -7,6 +7,7 @@ from api.views.probability import ProbabilityView
 from api.views.timeseries import TimeseriesView
 from api.views.exports import ExportView, ExportDownloadView
 from api.views.ml import MLPredictView, MLInfoView, MLExplainView
+from api.auth_views import RegisterView, LoginView, MeView
 
 urlpatterns = [
     path('health', HealthView.as_view()),
@@ -20,4 +21,7 @@ urlpatterns = [
     path('ml/predict', MLPredictView.as_view()),
     path('ml/info', MLInfoView.as_view()),
     path('ml/explain', MLExplainView.as_view()),
+    path('auth/register', RegisterView.as_view()),
+    path('auth/login', LoginView.as_view()),
+    path('auth/me', MeView.as_view()),
 ]
