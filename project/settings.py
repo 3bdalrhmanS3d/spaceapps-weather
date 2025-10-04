@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 from urllib.parse import urlparse, parse_qs
+import dj_database_url  # <= لو ركّبتها
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -76,12 +77,15 @@ def database_from_url(url: str):
     }
 
 DATABASES = {
-    'default': database_from_url(os.environ['DATABASE_URL'])
-} if os.environ.get('DATABASE_URL') else {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+"default": dj_database_url.parse(
+os.environ.get(
+"DATABASE_URL",
+# fallback to your Neon URL if env var is missing
+"postgresql://neondb_owner:npg_el8ACGstZOg0@ep-young-smoke-adff87p9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
+),
+conn_max_age=600,
+ssl_require=True,
+)
 }
 
 AUTH_PASSWORD_VALIDATORS = [
