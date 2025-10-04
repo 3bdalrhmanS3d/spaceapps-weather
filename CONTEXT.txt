@@ -1,0 +1,376 @@
+
+# ملخص الفكرة (منظور Backend)
+
+نبني خدمة باك-إند تُرجّع **احتمالات تاريخية** (وليست تنبؤ قصير المدى) لحدوث ظروف طقس غير مريحة في **مكان وتاريخ** يختارهما المستخدم، اعتمادًا على بيانات ناسا (NASA Data & Resources) عبر أدوات:
+
+* **GES DISC OPeNDAP (Hyrax)** لاستخراج مقاطع مكان/زمان من NetCDF بدقة عالية.
+* **Giovanni** للوصول السريع إلى time-series/خرائط (استخدام تحقّقي أو fallback).
+* **Data Rods for Hydrology** لسلاسل زمنية نقطية هيدرولوجية جاهزة (مطر/تربة…).
+* **Worldview** للعرض/المعاينة (Snapshots/tiles) — *ليس للحساب الإحصائي*.
+* **Earthdata Search** لاكتشاف المنتجات والإصدارات ونطاقات التغطية.
+* **Data access Tutorials** كمرجع خطوات رسمية لجلب وفتح الملفات.
+
+المخرجات الأساسية:
+
+* احتمالات: **Very Hot / Very Cold / Very Windy / Very Wet / Very Uncomfortable**.
+* **Climatology** لليوم المختار عبر آخر 15–20 سنة ضمن نافذة ±7 أيام، مع **CDF/percentiles** وإحصاءات وصفية.
+* **Export CSV/JSON** مع **Metadata**: المصدر/الوحدات/الإصدار/التاريخ.
+* **NASA-only Mode** افتراضيًا، و**Disclaimer** قانوني ظاهر.
+
+---
+
+# الفيتشرز (Backend)
+
+1. حساب الاحتمالات الخمسة (Thresholds قابلة للتخصيص + Profiles).
+2. إحصائيات وصفية + CDF/Boxplot data لكل متغيّر (T2M, RH2M, WS2M, PRCP).
+3. Sparkline سنوي لنمط الاحتمال عبر DOY.
+4. Profiles (Festival/Hiker/Runner/Fisher) تغيّر الـ thresholds تلقائيًا.
+5. Export CSV/JSON + Metadata كاملة.
+6. NASA-only Mode + Disclaimer ثابت.
+7. Caching (Redis) على مستوى الاستعلام.
+8. Rate Limiting + Logging + /health.
+9. Earthdata Auth hooks (لو احتاج المنتج تسجيل).
+10. Timeseries API + Trend Badge بسيط (↑/↓/—).
+11. **طبقة ML** (اختياري/مفعّل): دمج احتمالات ML مع Climatology (ensemble).
+
+---
+
+# البنية التقنية (Django)
+
+* **Django 5 + Django REST Framework**
+* **Redis** (django-redis) للكاش
+* **PostgreSQL/TimescaleDB** (اختياري) لحفظ الاستعلامات/النتائج
+* **drf-spectacular** (OpenAPI/Swagger)، **django-cors-headers**
+* هيكلة:
+
+```
+project/
+  settings.py, urls.py
+apps/
+  core/        # models العامة + utils (units, thresholds, serialization)
+  sources/     # NASA clients: opendap, power, giovanni, datarods, worldview, earthdata
+  climate/     # الحسابات: climatology, probability, metrics, comfort, trend
+  ai/          # ML registry + inference + ensemble
+  api/         # serializers, viewsets, routing
+  exports/     # توليد CSV/JSON (وممكن Celery jobs لاحقًا)
+```
+
+---
+
+# المودلز (Django Models مختصرة وقابلة للتوسع)
+
+**SourceProduct**
+
+* `key` (slug) — مثل: `"POWER_DAILY_CORE"`
+* `name`, `provider` (e.g., "NASA GES DISC")
+* `variables` (JSON: ["T2M","RH2M","WS2M","PRCP"])
+* `units_map` (JSON)
+* `access_type` ("opendap"|"api"|"giovanni"|"datarods"|"worldview")
+* `endpoint` (URL قالب DAP/REST)
+* `version`
+
+**ThresholdSet**
+
+* `name` ("default","festival","runner","hiker","fisher")
+* `very_hot_c`, `very_cold_c`, `very_windy_ms`, `very_wet_mm`, `hi_uncomfortable_c`, `dew_uncomfortable_c`
+
+**LocationQuery**
+
+* `lat`, `lon`, `date`, `window_days`(7), `years_back`(20)
+* `variables` (JSON)
+* `thresholds` (FK → ThresholdSet أو JSON snapshot)
+* `profile_name` (اختياري)
+* `nasa_only` (bool)
+* `created_at`
+
+**ProbabilityResult**
+
+* `query` (FK)
+* `sample_size`
+* `very_hot`, `very_cold`, `very_windy`, `very_wet`, `very_uncomfortable` (float 0..1)
+* `stats_json` (per var)
+* `sources_meta` (JSON)
+* `model_used` ("climatology|ensemble|ml")
+* `computed_ms`
+* `created_at`
+
+**TimeseriesPoint**
+
+* `query` (FK), `doy`, `year`, `var`, `value`
+
+**ExportRecord**
+
+* `query` (FK), `format`("csv"|"json"), `path`/`blob`, `ready`, `created_at`
+
+**(ML)**
+**MLModel**: `key`, `algo`, `version`, `thresholds_snapshot`, `features_spec`, `artifacts_path`, `metrics`, `is_active`, `created_at`
+**MLInferenceLog**: `model`(FK), `lat`,`lon`,`date`, `inputs`(JSON), `outputs`(JSON), `p_clim`(JSON), `p_final`(JSON), `took_ms`, `created_at`
+
+> للمراحل الأولى يمكن الاكتفاء بالكاش دون كتابة DB، ثم إضافة DB للحفظ/التحليلات.
+
+---
+
+# الـ Endpoints (DRF)
+
+## Health & Config & About
+
+* `GET /api/v1/health` → `{status:"ok",version,uptime}`
+* `GET /api/v1/config` → defaults, variables, units, profiles, nasa_only
+* `GET /api/v1/about` → نص **NASA does not endorse…** + سياسة الاستخدام
+* `GET /api/v1/sources` → المنتجات/الوحدات/الإصدارات وروابط رسمية
+
+## Probability (أساسي)
+
+* `POST /api/v1/probability`
+  **Request**
+
+```json
+{
+  "lat": 30.0444,
+  "lon": 31.2357,
+  "date": "2025-06-15",
+  "window_days": 7,
+  "years_back": 20,
+  "variables": ["T2M","RH2M","WS2M","PRCP"],
+  "thresholds": {"hot_c":35,"cold_c":5,"windy_ms":10,"wet_mm":10,"hi_c":40,"dew_c":24},
+  "profile": "festival",
+  "nasa_only": true,
+  "use_ml": true,
+  "alpha_mix": 0.6
+}
+```
+
+**Response (مختصر)**
+
+```json
+{
+  "location":{"lat":30.0444,"lon":31.2357},
+  "date":"2025-06-15",
+  "window_days":7,
+  "years_back":20,
+  "sample_size":400,
+  "probabilities":{
+    "very_hot":0.62,"very_cold":0.00,"very_windy":0.12,"very_wet":0.18,"very_uncomfortable":0.55
+  },
+  "stats":{
+    "T2M":{"mean":34.2,"p50":34.0,"p10":29.5,"p90":38.5,"std":3.1},
+    "PRCP":{"p50":0.0,"p90":15.0}
+  },
+  "metadata":{
+    "sources":[
+      {"product":"POWER_DAILY_CORE","provider":"NASA","version":"vX"}
+    ],
+    "units":{"T2M":"°C","RH2M":"%","WS2M":"m/s","PRCP":"mm/day"},
+    "disclaimer":"NASA does not endorse any non-U.S. Government entity..."
+  },
+  "model":{"key":"v1_lgbm_5heads","alpha":0.6,"mode":"ensemble"},
+  "breakdown":{"clim":{"very_hot":0.58},"ml":{"very_hot":0.66}},
+  "advice":"أعلى مخاطرة: حرارة شديدة (62%). وفّر ظل ومياه، وفضّل وقتًا مبكرًا."
+}
+```
+
+## Timeseries
+
+* `POST /api/v1/timeseries`
+
+```json
+{"lat":30.0444,"lon":31.2357,"var":"T2M","years_back":20,"doy":166,"window_days":7}
+```
+
+**Response**
+
+```json
+{
+  "series":[{"year":2006,"value":33.7},{"year":2007,"value":34.5},...],
+  "sparkline":[/* 365 نقاط مبسطة */],
+  "trend":{"direction":"up","slope":0.12}
+}
+```
+
+## Export
+
+* `POST /api/v1/export` → يجهّز ملف CSV/JSON بالمحتويات المختارة + Metadata
+* `GET /api/v1/export/{id}/download` → تنزيل الملف
+
+## ML (اختياري مفعّل)
+
+* `POST /api/v1/ml/predict` → احتمالات ML فقط
+* `GET /api/v1/ml/info` → مواصفات النموذج النشط + metrics
+* `POST /api/v1/ml/explain` → تفسير مبسط لأهم الـ features
+* (Admin) `POST /api/v1/ml/models`, `PATCH /api/v1/ml/models/{key}/activate`, `GET /api/v1/ml/models`, `POST /api/v1/ml/train` (لو فعلتم Celery)
+
+---
+
+# الخدمات (Services)
+
+## sources/*
+
+* **power_client.py**: استدعاء POWER API (قيم يومية) لسنوات ماضية ضمن نافذة ±7.
+* **opendap_client.py**: تكوين URLs، subset زمان/مكان، قراءة NetCDF (xarray/netCDF4).
+* **giovanni_client.py**: استخراج time-series نقطة/نطاق صغير (fallback/تحقق).
+* **datarods_client.py**: هيدرولوجيا نقطية سريعة.
+* **worldview_client.py**: روابط Snapshots/tiles للعرض البصري فقط.
+* **earthdata_search.py**: اكتشاف المنتجات/الإصدارات (اختياري).
+
+## climate/*
+
+* **climatology.py**: بناء عينات السنوات ضمن ±window حول DOY → مصفوفة قيم.
+* **metrics.py**: mean/median/std/percentiles/CDF.
+* **comfort.py**: Heat Index, Dew Point.
+* **probability.py**: حساب نسب التجاوز للـ thresholds.
+* **trend.py**: ميل خطي بسيط أو Mann-Kendall لاحقًا.
+
+## ai/*
+
+* **feature_builder.py**: بناء features من السلاسل (إحصاءات N سنة/نافذة، HI/DewPoint، اتجاهات 10–15 سنة).
+* **labeler.py**: تحويل السلاسل إلى Labels (0/1) حسب thresholds.
+* **ml_service.py**: تحميل النموذج النشط (joblib/pkl)، predict_proba، ensemble مع Climatology.
+* **registry.py**: إدارة MLModel/metrics/activation.
+
+## exports/*
+
+* **export_service.py**: بناء CSV/JSON + Metadata + توقيع وقت التنفيذ.
+
+---
+
+# القيم الافتراضية (قابلة للتعديل)
+
+* Very Hot: `T2M ≥ 35°C`
+* Very Cold: `T2M ≤ 5°C`
+* Very Windy: `WS2M ≥ 10 m/s`
+* Very Wet: `PRCP ≥ 10 mm/day`
+* Very Uncomfortable: `HI ≥ 40°C` **أو** `Dew Point ≥ 24°C`
+* نافذة: ±7 أيام حول يوم السنة، سنوات: 15–20 سنة.
+
+---
+
+# التسليم على مراحل (من الأبسط للأكبر)
+
+## المرحلة A (MVP سريع)
+
+1. `/health`, `/config`, `/about`, `/sources`.
+2. **POWER client** لجلب (T2M/RH/WS/PRCP) يوميًا لسنوات ماضية حول DOY±7.
+3. **climatology + metrics + comfort** (HI/DewPoint) + **probability**.
+4. `POST /probability` مع **Redis cache**.
+5. **Export JSON/CSV** بسيط.
+6. **Swagger** + اختبارات وحدات (comfort/probability).
+
+## المرحلة B (تحسينات)
+
+7. **OPeNDAP client** (NetCDF) لتحسين الدقة/المرونة.
+8. `POST /timeseries` + sparkline + trend بسيط.
+9. **Profiles** + **Advanced thresholds**.
+10. **Rate limiting** + **Structured logging**.
+
+## المرحلة C (عرض وتحليلات)
+
+11. **Worldview snapshot** في `metadata.preview`.
+12. تكاملات اختيارية: **Giovanni/Data Rods** كـ fallback/تحسين.
+13. تحسين Trend وإضافة اختبارات ثبات.
+
+---
+
+# الأمان والامتثال
+
+* **NASA-only Mode** افتراضيًا.
+* **Disclaimer** ظاهر: *“NASA does not endorse any non-U.S. Government entity …”*.
+* كل Response يحتوي **units** و**product_version** و**sources_meta**.
+* **API Key** بسيطة + CORS من الدومينات المعتمدة للهكاثون.
+* **Rate limit** (مثلًا: 60 طلب/دقيقة/مفتاح).
+* **Logs** منسقة (JSON) + Request ID + زمن الاستجابة.
+
+---
+
+# ملاحظات الأداء
+
+* **الكاش**: استخدم مفتاح مركّب `(lat,lon,doy,window,years,vars,thresholds_hash,nasa_only,product_keys)` بمدة 24–72 ساعة.
+* **تقليل زمن الاستجابة**:
+
+  * عينات مسبقة/تجميع أسبوعي في الـ FeatureBuilder.
+  * تقليل حجم subset في OPeNDAP (أبعاد دقيقة).
+  * إعادة استخدام الـ xarray dask-chunks (لو متاح).
+* **حجم العيّنة**: إظهار `sample_size` وشارة “بيانات قليلة” (<50).
+
+---
+
+# طبقة الـ ML التوقّعية (تفاصيل)
+
+**أين يدخل ML؟** فوق Climatology، كطبقة إضافية تُنتج احتمالات لكل حدث (خماسي الرؤوس) ويتم **دمجها** مع احتمالات Climatology:
+
+* **Features**: `lat, lon, doy, month, إحصاءات 20 سنة ضمن ±7 (mean/median/std/p10/p90 لكل متغيّر)، HI/DewPoint، اتجاهات 10–15 سنة (ميل خطي)، (اختياري: elevation/land cover).`
+* **Targets**: VeryHot/VeryCold/VeryWindy/VeryWet/VeryUncomfortable (0/1) من thresholds الحالية.
+* **نماذج**: baseline **Logistic Regression**، ثم **LightGBM/XGBoost**؛ **Calibration** (Platt/Isotonic).
+* **Ensemble**: `p_final = α * p_clim + (1-α) * p_ml` (افتراضي α=0.6).
+* **تقييم**: **Brier Score**, **PR-AUC**, **ROC-AUC**, **ECE**; تقسيم **Spatial-Temporal CV** لتجنّب التسريب.
+
+**Endpoints ML**:
+
+* `POST /api/v1/ml/predict` (ML فقط)
+* `GET /api/v1/ml/info` (بيانات النموذج النشط + metrics)
+* `POST /api/v1/ml/explain` (Top features مبسّطة)
+* (Admin) إدارة النماذج/التدريب.
+
+---
+
+# مكوّنات جاهزة (Contracts مختصرة)
+
+**ProbabilityRequest**
+
+* `lat: float, lon: float, date: date, window_days: int=7, years_back: int=20`
+* `variables: list[str]` افتراضيًا ["T2M","RH2M","WS2M","PRCP"]
+* `thresholds: {hot_c, cold_c, windy_ms, wet_mm, hi_c, dew_c}`
+* `profile: str | null`
+* `nasa_only: bool = true`
+* `use_ml: bool = false, alpha_mix: float = 0.6`
+
+**ProbabilityResponse**
+
+* `sample_size, probabilities{…}, stats{…}, metadata{sources,units,version,disclaimer}, model{…?}, advice`
+
+---
+
+# ملاحظات تنفيذية موسّعة (تشمل آخر فقرة طلبتها)
+
+* **تشغيل ML داخل Django**:
+
+  * خزن النموذج (scikit-learn/LightGBM) بصيغة **joblib** أو **pickle** في مسار مضبوط عبر ENV (مثلًا `ML_ARTIFACTS_PATH`).
+  * عند إقلاع السيرفر: حمِّل النموذج **مرة واحدة** (Singleton) مع **قفل** (thread-safe) لتفادي السباقات.
+  * أعِد التحميل فقط عند تفعيل نسخة جديدة عبر Endpoint Admin (تحديث قيمة `is_active`).
+* **الكاش مع ML**:
+
+  * **features cache** لكل `(lat,lon,doy,window,years)` لتقليل زمن بناء الـ features.
+  * **prediction cache** بنفس المفاتيح + `model_key` + `thresholds_hash` + `alpha_mix`.
+* **FeatureBuilder**:
+
+  * قلّل عدد طلبات الشبكة: اسحب نطاق السنة/النافذة على دفعات، واحتفظ بقطع xarray جاهزة.
+  * ضع **حارس جودة**: لو عدد السنوات الفعّالة < 10، ضع تحذير “ثقة أقل”.
+* **قياس الأداء**:
+
+  * الهدف: أول استعلام ≤ 5s (بدون كاش)، ومع الكاش ≤ 500ms.
+  * سجّل `computed_ms` في `ProbabilityResult` أو بالـ logs.
+* **ضبط العتبات**:
+
+  * ابدأ بالافتراضي ثم أضف Profiles؛ وفّر Advanced panel لتعديل يدوي مع **validation**.
+* **القابلية للتكرار والشفافية**:
+
+  * أعِد دائمًا **units**, **sources**, **product_version**, **sample_size**, **window_days**, **years_back** في الرد.
+  * أظهر شارة **“Climatology (Not a Forecast)”** لتفريقه عن التنبؤ قصير المدى.
+* **النشر**:
+
+  * Docker (gunicorn + nginx)، بيئة إنتاج مع متغيرات:
+
+    * `NASA_ONLY=true`, `REDIS_URL`, `POWER_ENDPOINT`, `OPENDAP_BASE`, `EARTHDATA_CREDENTIALS` (لو مطلوبة), `ML_ARTIFACTS_PATH`.
+* **الاختبارات**:
+
+  * وحدات: comfort, probability, metrics, feature_builder.
+  * تكامل: probability endpoint مع mocks لعملاء البيانات.
+  * تحميل نموذج ML تجريبي وقياس زمن inference.
+* **اللوائح والامتثال**:
+
+  * ضع **Disclaimer** في `/about` وضمن `metadata.disclaimer`.
+  * عند تفعيل مصادر غير حكومية، أظهر شارة **Non-U.S. Gov Source** وروابط شروط الاستخدام.
+* **تحسين لاحق**:
+
+  * دعم **Polygon/Area** (متوسط مساحة)، تحسين **IMERG (GPM)** للأمطار، وإضافة **MERRA-2** للرياح/الرطوبة بدقة أعلى إن لزم.
+
+---
